@@ -81,6 +81,7 @@ python scripts/sync_agents.py --check
   rolesync.json                 optional RoleSync project settings
   policy.json               optional workflow policy; informational to the generator
   roles/<role>.md
+  roles/<role>.claude.md    optional appendix rendered for one platform only (also .codex.md)
   skills/<skill>/SKILL.md
   references/*.md           optional supporting guidance
   generated-manifest.json   generated ownership/checksum record
@@ -102,7 +103,27 @@ Canonical skill directories may contain binary resources; they are mirrored byte
 
 ## Defining agents
 
-Each catalog role supplies an internal ID, lowercase-kebab-case generated name, description, role source under `.agents/roles/`, a skill under `.agents/skills/`, and provider-specific native settings. RoleSync validates required types and boundaries but intentionally does not hard-code every provider model or effort value; provider availability changes and must be verified in the installed runtime. Optional roles can set `"enabled": false`; disabled roles remain in canonical sources but are omitted from native discovery output until enabled.
+Each catalog role supplies an internal `id`, a lowercase-kebab-case generated `name`, a `description`, a `source` under `.agents/roles/`, and `codex` and `claude` native settings. RoleSync validates required types and boundaries but intentionally does not hard-code every provider model or effort value; provider availability changes and must be verified in the installed runtime.
+
+```json
+{
+  "id": "coder",
+  "name": "acme-coder",
+  "description": "Implement one bounded change with tests.",
+  "source": ".agents/roles/coder.md",
+  "skill": "acme-implement",
+  "codex": {"model": "gpt-5.6-terra", "model_reasoning_effort": "medium", "sandbox_mode": "workspace-write"},
+  "claude": {"model": "sonnet", "effort": "medium", "maxTurns": 40, "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write"], "permissionMode": "default", "isolation": "worktree"}
+}
+```
+
+Required: `id`, `name`, `description`, `source`, `codex.model`, `codex.model_reasoning_effort`, and `claude.model`. Everything else is optional, and omitting a key (or setting it to `null`) renders no line, so the runtime inherits its parent's setting instead of a pinned default:
+
+- `codex.sandbox_mode`, `claude.tools`, `claude.permissionMode`, `claude.maxTurns`, `claude.effort`, and `claude.isolation` (`"worktree"` also adds a base-branch warning to the body). Omit `sandbox_mode` when a Codex worker must keep the parent's mode, for example to write under `.codex/worktrees/`.
+- `skill` (one name) and `skills` (a list) name skills under `.agents/skills/`; they are merged in that order. They are preloaded through Claude's `skills:` frontmatter unless `claude.preloadSkills` is `false`, and referenced at the end of the body on both platforms as `Primary workflow: ...` (one skill) or `Workflow skills: ...` (several). A role with no skill gets neither.
+- Other native Claude frontmatter passes through verbatim from the `claude` object: `disallowedTools`, `color`, `mcpServers`, `hooks`, `memory`, `background`, `initialPrompt`, and `omitClaudeMd`. Values are type-checked; unknown keys are ignored.
+- `enabled: false` keeps a role in canonical sources but omits it from native output. `platforms` limits a role to `["claude"]` or `["codex"]` within the project's platform selection; use it for a Claude main-session agent that Codex has no way to run. Outputs for the dropped platform are removed as stale.
+- A file named `<stem>.claude.md` or `<stem>.codex.md` next to a role source (for `roles/coder.md`, `roles/coder.claude.md`) is appended after the shared body for that platform only, for rules that differ between runtimes.
 
 `policy.json`, role `activation` notes, and prose permissions do not become enforcement just because they are rendered. Filesystem sandboxing, connector credentials, repository protections, and runtime settings remain the actual security boundaries.
 

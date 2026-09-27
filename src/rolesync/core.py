@@ -26,6 +26,29 @@ SENSITIVE_SKILL_NAMES = {".env", "id_rsa", "id_dsa", "id_ed25519"}
 SENSITIVE_SKILL_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
 IGNORED_SKILL_NAMES = {".DS_Store", "Thumbs.db"}
 IGNORED_SKILL_SUFFIXES = {".pyc", ".swp", ".swo", "~"}
+PLATFORMS = ("claude", "codex")
+KEBAB = r"[a-z][a-z0-9-]*"
+
+
+def _is_nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_str_list(value: object) -> bool:
+    return isinstance(value, list) and all(_is_nonempty_str(x) for x in value)
+
+
+# Native Claude Code frontmatter accepted verbatim from a role's `claude` object, in render order.
+CLAUDE_PASSTHROUGH: dict[str, tuple] = {
+    "disallowedTools": (_is_str_list, "a list of non-empty strings"),
+    "color": (_is_nonempty_str, "a non-empty string"),
+    "mcpServers": (lambda v: isinstance(v, (list, dict)), "a list or an object"),
+    "hooks": (lambda v: isinstance(v, dict), "an object"),
+    "memory": (_is_nonempty_str, "a non-empty string"),
+    "background": (lambda v: isinstance(v, bool), "a boolean"),
+    "initialPrompt": (_is_nonempty_str, "a non-empty string"),
+    "omitClaudeMd": (lambda v: isinstance(v, bool), "a boolean"),
+}
 
 
 class RoleSyncError(ValueError):
@@ -115,6 +138,54 @@ def _platforms(root: Path) -> set[str]:
     return set(values)
 
 
+def _role_skills(role: dict, where: str) -> list[str]:
+    """Merge `skill` (string) and `skills` (list) into one ordered, de-duplicated list; both are optional."""
+    result: list[str] = []
+    skill = role.get("skill")
+    if skill is not None:
+        if not isinstance(skill, str) or not re.fullmatch(KEBAB, skill):
+            raise RoleSyncError(f"{where}.skill must be lowercase-kebab-case or null")
+        result.append(skill)
+    skills = role.get("skills")
+    if skills is not None:
+        if not isinstance(skills, list) or any(not isinstance(x, str) or not re.fullmatch(KEBAB, x) for x in skills):
+            raise RoleSyncError(f"{where}.skills must be a list of lowercase-kebab-case names")
+        for name in skills:
+            if name not in result:
+                result.append(name)
+    return result
+
+
+def _role_platforms(role: dict, where: str) -> set[str]:
+    values = role.get("platforms")
+    if values is None:
+        return set(PLATFORMS)
+    if not isinstance(values, list) or not values or any(v not in PLATFORMS for v in values) or len(set(values)) != len(values):
+        raise RoleSyncError(f"{where}.platforms must be a non-empty list containing only claude/codex without duplicates")
+    return set(values)
+
+
+def _appendix_path(root: Path, source_rel: str, platform: str) -> Path:
+    """`.agents/roles/<stem>.<platform>.md` next to the role source; appended to the body for that platform only."""
+    source = PurePosixPath(source_rel)
+    return root.joinpath(*source.with_name(f"{source.stem}.{platform}.md").parts)
+
+
+def _appendix_text(root: Path, source_rel: str, platform: str) -> str:
+    path = _appendix_path(root, source_rel, platform)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _workflow_line(skills: list[str]) -> str:
+    if not skills:
+        return ""
+    refs = ", ".join(f"`.agents/skills/{skill}/SKILL.md`" for skill in skills)
+    label = "Primary workflow" if len(skills) == 1 else "Workflow skills"
+    return f"\n\n{label}: {refs}."
+
+
 def _validate_catalog(root: Path) -> tuple[dict, str]:
     agents = root / ".agents"
     if not agents.is_dir() or agents.is_symlink():
@@ -131,7 +202,7 @@ def _validate_catalog(root: Path) -> tuple[dict, str]:
     common = common_path.read_text(encoding="utf-8").strip()
     seen_ids: set[str] = set()
     seen_names: set[str] = set()
-    required = {"id", "name", "description", "source", "skill", "codex", "claude"}
+    required = {"id", "name", "description", "source", "codex", "claude"}
     for i, role in enumerate(roles):
         where = f".agents/catalog.json: roles[{i}]"
         if not isinstance(role, dict):
@@ -148,7 +219,7 @@ def _validate_catalog(root: Path) -> tuple[dict, str]:
         if role_id in seen_ids:
             raise RoleSyncError(f"{where}.id duplicates {role_id}")
         seen_ids.add(role_id)
-        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        if not isinstance(name, str) or not re.fullmatch(KEBAB, name):
             raise RoleSyncError(f"{where}.name must be lowercase-kebab-case")
         if name in seen_names:
             raise RoleSyncError(f"{where}.name duplicates {name}")
@@ -164,29 +235,43 @@ def _validate_catalog(root: Path) -> tuple[dict, str]:
             raise RoleSyncError(f"Role source outside canonical directory: {source}")
         if (root / source_rel).is_symlink():
             raise RoleSyncError(f"{where}.source must not be a symlink")
-        skill = role["skill"]
-        if not isinstance(skill, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", skill):
-            raise RoleSyncError(f"{where}.skill must be lowercase-kebab-case")
-        skill_file = agents / "skills" / skill / "SKILL.md"
-        if not skill_file.is_file() or skill_file.is_symlink():
-            raise RoleSyncError(f"Missing skill: {skill}")
+        for skill in _role_skills(role, where):
+            skill_file = agents / "skills" / skill / "SKILL.md"
+            if not skill_file.is_file() or skill_file.is_symlink():
+                raise RoleSyncError(f"Missing skill: {skill}")
+        _role_platforms(role, where)
+        for platform in PLATFORMS:
+            appendix = _appendix_path(root, source_rel, platform)
+            if appendix.is_symlink() or (appendix.exists() and not appendix.is_file()):
+                raise RoleSyncError(f"{where} appendix must be a normal file: {appendix}")
+            if appendix.exists() and not appendix.resolve().is_relative_to(roles_root):
+                raise RoleSyncError(f"Role appendix outside canonical directory: {appendix}")
         codex = role["codex"]
         claude = role["claude"]
-        if not isinstance(codex, dict) or not all(isinstance(codex.get(k), str) and codex[k] for k in ("model", "model_reasoning_effort", "sandbox_mode")):
-            raise RoleSyncError(f"{where}.codex requires non-empty model, model_reasoning_effort, and sandbox_mode strings")
+        if not isinstance(codex, dict) or not all(_is_nonempty_str(codex.get(k)) for k in ("model", "model_reasoning_effort")):
+            raise RoleSyncError(f"{where}.codex requires non-empty model and model_reasoning_effort strings")
+        if codex.get("sandbox_mode") is not None and not _is_nonempty_str(codex["sandbox_mode"]):
+            raise RoleSyncError(f"{where}.codex.sandbox_mode must be a non-empty string or null")
         if not isinstance(claude, dict):
             raise RoleSyncError(f"{where}.claude must be an object")
-        for key in ("model", "permissionMode"):
-            if not isinstance(claude.get(key), str) or not claude[key]:
-                raise RoleSyncError(f"{where}.claude.{key} must be a non-empty string")
-        if not isinstance(claude.get("tools"), list) or any(not isinstance(x, str) or not x for x in claude["tools"]):
-            raise RoleSyncError(f"{where}.claude.tools must be a list of non-empty strings")
-        if not isinstance(claude.get("maxTurns"), int) or isinstance(claude["maxTurns"], bool) or claude["maxTurns"] <= 0:
-            raise RoleSyncError(f"{where}.claude.maxTurns must be a positive integer")
+        if not _is_nonempty_str(claude.get("model")):
+            raise RoleSyncError(f"{where}.claude.model must be a non-empty string")
+        if claude.get("permissionMode") is not None and not _is_nonempty_str(claude["permissionMode"]):
+            raise RoleSyncError(f"{where}.claude.permissionMode must be a non-empty string or null")
+        if claude.get("tools") is not None and not _is_str_list(claude["tools"]):
+            raise RoleSyncError(f"{where}.claude.tools must be a list of non-empty strings or null")
+        max_turns = claude.get("maxTurns")
+        if max_turns is not None and (not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns <= 0):
+            raise RoleSyncError(f"{where}.claude.maxTurns must be a positive integer or null")
         if claude.get("effort") is not None and not isinstance(claude["effort"], str):
             raise RoleSyncError(f"{where}.claude.effort must be a string or null")
         if claude.get("isolation") not in {None, "worktree"}:
             raise RoleSyncError(f"{where}.claude.isolation must be worktree or null")
+        if claude.get("preloadSkills") is not None and not isinstance(claude["preloadSkills"], bool):
+            raise RoleSyncError(f"{where}.claude.preloadSkills must be a boolean or null")
+        for key, (check, expected) in CLAUDE_PASSTHROUGH.items():
+            if claude.get(key) is not None and not check(claude[key]):
+                raise RoleSyncError(f"{where}.claude.{key} must be {expected} or null")
     return catalog, common
 
 
@@ -256,22 +341,34 @@ def _render(root: Path) -> tuple[dict[str, bytes], set[str]]:
     platforms = _platforms(root)
     output: dict[str, bytes] = {}
     executables: set[str] = set()
-    for role in catalog["roles"]:
+    for index, role in enumerate(catalog["roles"]):
         if role.get("enabled", True) is False:
             continue
+        where = f".agents/catalog.json: roles[{index}]"
+        role_platforms = _role_platforms(role, where) & platforms
         name = role["name"]
         body = (root / role["source"]).read_text(encoding="utf-8").strip()
-        skill = role["skill"]
-        instructions = common + "\n\n" + body + f"\n\nPrimary workflow: `.agents/skills/{skill}/SKILL.md`."
-        if "codex" in platforms:
+        skills = _role_skills(role, where)
+        workflow = _workflow_line(skills)
+
+        def instructions_for(platform: str) -> str:
+            text = common + "\n\n" + body
+            appendix = _appendix_text(root, role["source"], platform)
+            if appendix:
+                text += "\n\n" + appendix
+            return text + workflow
+
+        if "codex" in role_platforms:
             cx = role["codex"]
+            instructions = instructions_for("codex")
             fields = {
                 "name": name,
                 "description": role["description"],
                 "model": cx["model"],
                 "model_reasoning_effort": cx["model_reasoning_effort"],
-                "sandbox_mode": cx["sandbox_mode"],
             }
+            if cx.get("sandbox_mode") is not None:
+                fields["sandbox_mode"] = cx["sandbox_mode"]
             toml = "# " + MARKER + "\n" + "\n".join(
                 f"{k} = {json.dumps(v, ensure_ascii=False)}" for k, v in fields.items()
             ) + "\n"
@@ -284,18 +381,22 @@ def _render(root: Path) -> tuple[dict[str, bytes], set[str]]:
             except tomllib.TOMLDecodeError as exc:
                 raise RoleSyncError(f"Generated TOML for role {name!r} is invalid: {exc}") from exc
             output[f".codex/agents/{name}.toml"] = toml.encode("utf-8")
-        if "claude" in platforms:
+        if "claude" in role_platforms:
             cl = role["claude"]
-            front = {
+            front: dict[str, object] = {
                 "name": name,
                 "description": role["description"],
                 "model": cl["model"],
-                "tools": cl["tools"],
-                "permissionMode": cl["permissionMode"],
-                "maxTurns": cl["maxTurns"],
-                "skills": [skill],
             }
-            role_instructions = instructions
+            if cl.get("tools") is not None:
+                front["tools"] = cl["tools"]
+            if cl.get("permissionMode") is not None:
+                front["permissionMode"] = cl["permissionMode"]
+            if cl.get("maxTurns") is not None:
+                front["maxTurns"] = cl["maxTurns"]
+            if skills and cl.get("preloadSkills", True) is not False:
+                front["skills"] = skills
+            role_instructions = instructions_for("claude")
             if cl.get("effort") is not None:
                 front["effort"] = cl["effort"]
             if cl.get("isolation"):
@@ -307,6 +408,9 @@ def _render(root: Path) -> tuple[dict[str, bytes], set[str]]:
                     "checkout; report an unresolved base mismatch. Resuming escalated work requires the preserved "
                     "patch/dependency commits, not just a fresh default-branch checkout."
                 )
+            for key in CLAUDE_PASSTHROUGH:
+                if cl.get(key) is not None:
+                    front[key] = cl[key]
             yaml = "---\n" + "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in front.items())
             text_value = yaml + "\n---\n\n<!-- " + MARKER + " -->\n\n" + role_instructions + "\n"
             output[f".claude/agents/{name}.md"] = text_value.encode("utf-8")
