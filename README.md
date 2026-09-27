@@ -38,6 +38,18 @@ Built-in presets:
 
 Choose `--platform claude`, `--platform codex`, or `--platform both`. The selection is stored in `.agents/rolesync.json`. Projects initialized by `1.0.0rc1` or `1.0.0` that still contain `.agents/loom.json` remain supported as a legacy fallback; new projects write `.agents/rolesync.json`.
 
+## Adopting an existing project
+
+`init` only works on a project without `.agents/`. To bring a project that already has hand-written `.claude/agents/*.md`, `.claude/skills/*`, or `.codex/agents/*.toml` under RoleSync:
+
+1. Create the canonical sources by hand: `.agents/catalog.json`, `.agents/common.md`, one `.agents/roles/<id>.md` per role, and `.agents/skills/<name>/` per skill. Running `rolesync init` in a scratch directory gives you a preset to copy from. Add `.agents/rolesync.json` if you want only one platform.
+2. Move each hand-written agent's body into its role file and its frontmatter or TOML settings into the catalog entry. Move skills into `.agents/skills/<name>/`, keeping helper scripts and their executable bits.
+3. Remove the old native files and any `.claude/skills/<name>` symlinks before the first sync. RoleSync refuses to write through a symlink and refuses to overwrite a file that is not recorded in `.agents/generated-manifest.json`; each error names the path and the remedy. Nothing is deleted or replaced for you.
+4. Run `rolesync sync`, then `rolesync check`, and review the diff.
+5. Commit the result. When a tracked symlink such as `.claude/skills/<name>` has become a real directory, `git commit -- <pathspec>` can fail with "does not have a commit checked out"; stage with `git add -A .agents .claude .codex` and commit the index without a pathspec.
+
+Claude Code can run a generated agent as the main-session agent through `"agent": "<name>"` in `.claude/settings.json`. RoleSync never manages `settings.json`; set it by hand and keep that role enabled for Claude.
+
 ## Commands
 
 ```text
@@ -86,7 +98,7 @@ RoleSync treats repository paths and the generated manifest as untrusted input. 
 
 Synchronization is staged and guarded by a cross-process lock. Before applying a multi-file update, RoleSync stores recovery copies and a transaction journal. A later `sync` restores an interrupted transaction before generating new output.
 
-Canonical skill directories may contain binary resources; they are mirrored byte-for-byte for Claude. Common transient files are ignored, while likely secret files such as `.env`, private keys, and PKCS#12 bundles are rejected rather than copied. This is a guardrail, not a replacement for repository secret scanning.
+Canonical skill directories may contain binary resources; they are mirrored byte-for-byte for Claude, and a helper script's executable bit is mirrored too (mode handling is skipped on Windows). `check` reports a mode-only difference as `mode:<path>`, and `sync` repairs it. Common transient files are ignored, while likely secret files such as `.env`, private keys, and PKCS#12 bundles are rejected rather than copied. This is a guardrail, not a replacement for repository secret scanning.
 
 ## Defining agents
 
