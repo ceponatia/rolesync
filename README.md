@@ -19,7 +19,7 @@ pipx install rolesync
 uvx rolesync --version
 ```
 
-`rolesync` is currently a pre-release (`1.0.0rc1`) on PyPI. Since it's the only version published so far, `pip`/`pipx`/`uv` install it by default with no extra flags.
+Stable releases are published to PyPI, and `pip`, `pipx`, and `uv` install the latest one by default. Upgrade with `uv tool upgrade rolesync` or `pipx upgrade rolesync`; [CHANGELOG.md](CHANGELOG.md) lists what each release changes and any follow-up `rolesync sync` it needs.
 
 ## Quick start
 
