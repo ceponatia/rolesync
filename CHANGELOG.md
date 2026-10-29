@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keep synchronization recovery state in a private user directory outside the checkout. Reject untrusted legacy recovery state and linked recovery components, and use exclusive temporary files for atomic writes. Interrupted transactions created by this version remain recoverable automatically.
+
 ## 1.1.0 - 2026-09-27
 
 - Mirrored skill files keep their executable bit. A canonical `.agents/skills/<name>/helper.sh` with `+x` now lands in `.claude/skills/<name>/` with `+x`; `check` reports a mode mismatch as `mode:<path>`, and `sync` repairs it even when only the mode differs. Mode handling is skipped on Windows.

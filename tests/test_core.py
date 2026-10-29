@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from rolesync.cli import init_project
+from rolesync import core
 from rolesync.core import RoleSyncError, MANIFEST, render, sync
 
 
@@ -23,6 +24,11 @@ class CoreSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "project with ünicode"
+        home = Path(self.temp.name) / "home"
+        home.mkdir()
+        self.home_patch = mock.patch("rolesync.core.Path.home", return_value=home)
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
         init_project(self.root, "minimal", "both")
 
     def tearDown(self):
@@ -167,7 +173,8 @@ class CoreSafetyTests(unittest.TestCase):
         secret.write_text("do not leak me\n", encoding="utf-8")
         target = self.root / ".claude/agents/rolesync-coder.md"
         original = target.read_bytes()
-        txn = self.root / ".agents/.rolesync-txn-evil"
+        txn = core._transaction_home(self.root, create=True) / ".rolesync-txn-evil"
+        txn.mkdir(mode=0o700)
         (txn / "backups").mkdir(parents=True)
         (txn / "journal.json").write_text(json.dumps({
             "state": "applying",
@@ -246,7 +253,8 @@ class CoreSafetyTests(unittest.TestCase):
     def test_incomplete_transaction_is_recovered_before_sync(self):
         target = self.root / ".claude/agents/rolesync-coder.md"
         original = target.read_bytes()
-        txn = self.root / ".agents/.rolesync-txn-test"
+        txn = core._transaction_home(self.root, create=True) / ".rolesync-txn-test"
+        txn.mkdir(mode=0o700)
         backups = txn / "backups"
         backups.mkdir(parents=True)
         (backups / "0.bak").write_bytes(original)
@@ -255,6 +263,208 @@ class CoreSafetyTests(unittest.TestCase):
             "operations": [{"rel": ".claude/agents/rolesync-coder.md", "backup": "0.bak", "created": False, "stage": "0.new"}],
         }), encoding="utf-8")
         target.write_text("partial write", encoding="utf-8")
+        sync(self.root)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(txn.exists())
+
+    def _recovery_fixture(self, *, trusted=True, rel=".claude/agents/rolesync-coder.md"):
+        parent = core._transaction_home(self.root, create=True) if trusted else self.root / ".agents"
+        txn = parent / ".rolesync-txn-fixture"
+        txn.mkdir(mode=0o700)
+        (txn / "backups").mkdir()
+        target = self.root / rel
+        (txn / "backups/0.bak").write_bytes(target.read_bytes())
+        (txn / "journal.json").write_text(json.dumps({
+            "state": "applying",
+            "operations": [{"rel": rel, "backup": "0.bak", "created": False, "stage": "0.new"}],
+        }), encoding="utf-8")
+        return txn, target
+
+    def _symlink(self, link, target, *, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation not permitted: {exc}")
+
+    def test_in_project_transaction_is_not_replayed(self):
+        txn, target = self._recovery_fixture(trusted=False)
+        original = target.read_bytes()
+        (txn / "backups/0.bak").write_bytes(b"untrusted recovery data")
+        with self.assertRaisesRegex(RoleSyncError, "untrusted in-project"):
+            sync(self.root)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertTrue(txn.exists())
+        self.assertIn("incomplete-transaction", sync(self.root, check=True))
+
+    def test_repository_backup_directory_link_cannot_read_host_file(self):
+        txn, target = self._recovery_fixture(trusted=False)
+        original = target.read_bytes()
+        outside = Path(self.temp.name) / "outside-backups"
+        outside.mkdir()
+        secret = outside / "0.bak"
+        secret.write_bytes(b"private host data")
+        shutil.rmtree(txn / "backups")
+        self._symlink(txn / "backups", outside, directory=True)
+        with self.assertRaises(RoleSyncError):
+            sync(self.root)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(secret.read_bytes(), b"private host data")
+
+    def test_repository_restore_link_cannot_overwrite_host_file(self):
+        _, target = self._recovery_fixture(trusted=False)
+        victim = Path(self.temp.name) / "host-file"
+        victim.write_bytes(b"keep host file")
+        self._symlink(target.with_name(target.name + ".rolesync-restore"), victim)
+        with self.assertRaises(RoleSyncError):
+            sync(self.root)
+        self.assertEqual(victim.read_bytes(), b"keep host file")
+
+    def test_trusted_recovery_ignores_old_predictable_temporary_leaf(self):
+        txn, target = self._recovery_fixture()
+        original = target.read_bytes()
+        target.write_bytes(b"interrupted output")
+        victim = Path(self.temp.name) / "host-file"
+        victim.write_bytes(b"keep host file")
+        old_temp = target.with_name(target.name + ".rolesync-restore")
+        self._symlink(old_temp, victim)
+        sync(self.root)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(victim.read_bytes(), b"keep host file")
+        self.assertTrue(old_temp.is_symlink())
+        self.assertFalse(txn.exists())
+
+    def test_recovery_rejects_linked_components_before_writing(self):
+        for component in ("transaction", "journal", "backups", "backup"):
+            with self.subTest(component=component):
+                txn, target = self._recovery_fixture()
+                original = target.read_bytes()
+                path = {"transaction": txn, "journal": txn / "journal.json", "backups": txn / "backups", "backup": txn / "backups/0.bak"}[component]
+                moved = Path(self.temp.name) / ("moved-" + component)
+                path.rename(moved)
+                self._symlink(path, moved, directory=component in {"transaction", "backups"})
+                with self.assertRaises(RoleSyncError):
+                    sync(self.root)
+                self.assertEqual(target.read_bytes(), original)
+                path.unlink()
+                moved.rename(path)
+                shutil.rmtree(txn)
+
+    def test_hardlinked_backup_is_rejected(self):
+        txn, target = self._recovery_fixture()
+        original = target.read_bytes()
+        backup = txn / "backups/0.bak"
+        backup.unlink()
+        try:
+            os.link(target, backup)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        with self.assertRaisesRegex(RoleSyncError, "unlinked file"):
+            sync(self.root)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_recovery_validates_all_operations_before_mutating(self):
+        txn, target = self._recovery_fixture()
+        target.write_bytes(b"interrupted output")
+        journal = json.loads((txn / "journal.json").read_text())
+        journal["operations"].insert(0, {"rel": ".claude/agents/missing.md", "backup": "missing.bak", "created": False})
+        (txn / "journal.json").write_text(json.dumps(journal))
+        with self.assertRaises(FileNotFoundError):
+            sync(self.root)
+        self.assertEqual(target.read_bytes(), b"interrupted output")
+
+    def test_recovery_removes_only_outputs_created_by_interrupted_sync(self):
+        txn, target = self._recovery_fixture()
+        created = self.root / ".claude/agents/created.md"
+        created.write_bytes(b"partial new output")
+        journal = json.loads((txn / "journal.json").read_text())
+        journal["operations"].append({"rel": ".claude/agents/created.md", "backup": None, "created": True})
+        (txn / "journal.json").write_text(json.dumps(journal))
+        sync(self.root)
+        self.assertFalse(created.exists())
+        self.assertTrue(target.exists())
+
+    def test_transaction_state_is_outside_checkout_and_private(self):
+        home = core._transaction_home(self.root, create=True)
+        self.assertFalse(home.is_relative_to(self.root))
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o700)
+            home.chmod(0o755)
+            with self.assertRaisesRegex(RoleSyncError, "private"):
+                sync(self.root)
+
+    def test_symlinked_state_root_is_rejected(self):
+        state = core._transaction_home(self.root, create=True).parent
+        moved = state.with_name("moved-state")
+        state.rename(moved)
+        self._symlink(state, moved, directory=True)
+        with self.assertRaisesRegex(RoleSyncError, "normal directory"):
+            sync(self.root)
+
+    def test_failed_apply_is_recovered_on_next_sync(self):
+        source = self.root / ".agents/roles/coder.md"
+        source.write_text(source.read_text() + "\nChanged instructions.\n")
+        replace = os.replace
+        calls = 0
+
+        def fail_after_first_write(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise OSError("simulated interruption")
+            return replace(*args, **kwargs)
+
+        with mock.patch("rolesync.core.os.replace", side_effect=fail_after_first_write):
+            with self.assertRaisesRegex(OSError, "simulated interruption"):
+                sync(self.root)
+        self.assertTrue(core._transaction_dirs(self.root))
+        sync(self.root)
+        self.assertEqual(sync(self.root, check=True), [])
+        self.assertEqual(core._transaction_dirs(self.root), [])
+
+    def test_exclusive_restore_creation_cannot_follow_existing_link(self):
+        victim = Path(self.temp.name) / "host-file"
+        victim.write_bytes(b"keep host file")
+        target = self.root / ".claude/agents/rolesync-coder.md"
+        original = target.read_bytes()
+        temp = target.parent / ".rolesync-write-collision"
+        self._symlink(temp, victim)
+        with mock.patch("rolesync.core.uuid.uuid4", return_value=mock.Mock(hex="collision")):
+            with self.assertRaises(FileExistsError):
+                core._atomic_transaction_write(self.root, target, b"new bytes", 0o644)
+        self.assertEqual(victim.read_bytes(), b"keep host file")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertTrue(temp.is_symlink())
+
+    def test_restore_pins_destination_directory_during_replacement(self):
+        if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("directory descriptors unavailable")
+        target = self.root / ".claude/agents/rolesync-coder.md"
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        moved = target.parent.with_name("moved-agents")
+        replace = os.replace
+
+        def replace_after_swap(*args, **kwargs):
+            target.parent.rename(moved)
+            self._symlink(target.parent, outside, directory=True)
+            return replace(*args, **kwargs)
+
+        with mock.patch("rolesync.core.os.replace", side_effect=replace_after_swap):
+            core._atomic_transaction_write(self.root, target, b"restored", 0o644)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual((moved / target.name).read_bytes(), b"restored")
+        self.assertFalse(list(moved.glob(".rolesync-write-*")))
+
+    def test_check_does_not_create_private_state(self):
+        home = core._transaction_home(self.root).parent
+        shutil.rmtree(home)
+        self.assertEqual(sync(self.root, check=True), [])
+        self.assertFalse(home.exists())
+
+    def test_recovery_restores_manifest_as_well_as_outputs(self):
+        txn, target = self._recovery_fixture(rel=MANIFEST)
+        original = target.read_bytes()
+        target.write_bytes(b"interrupted manifest")
         sync(self.root)
         self.assertEqual(target.read_bytes(), original)
         self.assertFalse(txn.exists())

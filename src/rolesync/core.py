@@ -85,7 +85,7 @@ def _reject_symlink_chain(root: Path, path: Path) -> None:
     cursor = root
     for part in rel.parts:
         cursor = cursor / part
-        if cursor.exists() and cursor.is_symlink():
+        if cursor.is_symlink() or (cursor.exists() and getattr(cursor.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
             raise RoleSyncError(
                 f"Refusing to operate through symlink: {cursor}. RoleSync writes only through real "
                 "directories and files. Remove the symlink (its target is left alone) or replace it with a "
@@ -540,30 +540,131 @@ def _project_lock(root: Path) -> Iterator[None]:
             handle.close()
 
 
+def _normal_directory(path: Path, *, private: bool = False) -> None:
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise RoleSyncError(f"Transaction directory must be a normal directory: {path}")
+    if private and os.name != "nt":
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise RoleSyncError(f"Transaction directory must be private to the current user: {path}")
+
+
+def _transaction_home(root: Path, *, create: bool = False) -> Path:
+    # Deliberately independent of the checkout and its configuration/environment files.
+    state = Path.home().resolve() / ".rolesync-state"
+    if state.is_relative_to(root.resolve()):
+        raise RoleSyncError("Transaction state must be outside the project root")
+    project = state / hashlib.sha256(os.fsencode(root.resolve())).hexdigest()
+    for directory in (state, project):
+        if create:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.exists() or directory.is_symlink():
+            _normal_directory(directory, private=True)
+    return project
+
+
 def _transaction_dirs(root: Path) -> list[Path]:
     agents = root / ".agents"
-    return sorted(p for p in agents.glob(".rolesync-txn-*") if p.is_dir())
+    _reject_symlink_chain(root, agents)
+    # Include legacy entries for diagnostics, but never adopt them as trusted state.
+    legacy = sorted(agents.glob(".rolesync-txn-*"))
+    home = _transaction_home(root)
+    return legacy + sorted(home.glob(".rolesync-txn-*"))
+
+
+def _transaction_file(path: Path) -> tuple[bytes, int]:
+    """Read only an ordinary, unlinked file; never follow a recovery-file link."""
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or getattr(before, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise RoleSyncError(f"Transaction file must be a normal, unlinked file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
+            raise RoleSyncError(f"Transaction file changed while opening: {path}")
+        return handle.read(), stat.S_IMODE(info.st_mode)
+
+
+@contextmanager
+def _target_parent(root: Path, target: Path) -> Iterator[int | None]:
+    """Pin the real destination directory on systems supporting directory descriptors."""
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        _reject_symlink_chain(root, target.parent)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_chain(root, target.parent)
+        yield None
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        for part in target.parent.relative_to(root).parts:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _atomic_transaction_write(root: Path, target: Path, data: bytes, mode: int) -> None:
+    # Exclusive creation prevents a pre-existing temporary leaf from redirecting writes.
+    with _target_parent(root, target) as parent_fd:
+        name = f".rolesync-write-{uuid.uuid4().hex}"
+        temp = target.parent / name if parent_fd is None else name
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600, dir_fd=parent_fd)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise RoleSyncError("Restore temporary file must be a normal file")
+                handle.write(data)
+                if os.name != "nt":
+                    os.fchmod(handle.fileno(), mode)
+            if parent_fd is None:
+                _reject_symlink_chain(root, target.parent)
+                os.replace(temp, target)
+            else:
+                os.replace(temp, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        finally:
+            try:
+                os.unlink(temp, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _safe_backup_path(txn: Path, name: object) -> Path:
     if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in {".", ".."}:
         raise RoleSyncError(f"Invalid transaction backup reference: {name!r}")
-    backups_dir = (txn / "backups").resolve()
-    candidate = (txn / "backups" / name).resolve(strict=False)
-    if not candidate.is_relative_to(backups_dir):
-        raise RoleSyncError(f"Transaction backup escapes its directory: {name!r}")
-    return candidate
+    backups_dir = txn / "backups"
+    _normal_directory(backups_dir)
+    return backups_dir / name
 
 
 def _restore_transaction(root: Path, txn: Path) -> None:
+    if txn.parent != _transaction_home(root) or not re.fullmatch(r"\.rolesync-txn-[a-zA-Z0-9_-]+", txn.name):
+        raise RoleSyncError(
+            f"Refusing untrusted in-project transaction: {txn}. Preserve it for manual review; "
+            "move it outside .agents before running sync again."
+        )
+    _normal_directory(txn, private=True)
     journal_path = txn / "journal.json"
-    if not journal_path.is_file():
+    if not journal_path.exists() and not journal_path.is_symlink():
         shutil.rmtree(txn, ignore_errors=True)
         return
-    journal = _read_json(journal_path, str(journal_path))
-    if journal.get("state") != "applying" or not isinstance(journal.get("operations"), list):
+    try:
+        journal = json.loads(_transaction_file(journal_path)[0])
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RoleSyncError(f"Invalid transaction journal: {journal_path}") from exc
+    if not isinstance(journal, dict) or journal.get("state") not in {"applying", "complete"} or not isinstance(journal.get("operations"), list):
+        raise RoleSyncError(f"Invalid transaction journal: {journal_path}")
+    if journal["state"] == "complete":
         shutil.rmtree(txn, ignore_errors=True)
         return
+    restores = []
+    # Validate and read every source before modifying any destination.
     for op in reversed(journal["operations"]):
         if not isinstance(op, dict):
             raise RoleSyncError(f"Invalid transaction operation entry: {op!r}")
@@ -571,14 +672,19 @@ def _restore_transaction(root: Path, txn: Path) -> None:
         target = _safe_metadata_path(root, rel) if rel == MANIFEST else _safe_managed_path(root, rel)
         backup_name = op.get("backup")
         backup = _safe_backup_path(txn, backup_name) if backup_name else None
-        if backup and backup.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_name(target.name + ".rolesync-restore")
-            shutil.copy2(backup, temp)
-            os.replace(temp, target)
-        elif op.get("created") and target.exists():
-            if target.is_file() or target.is_symlink():
-                target.unlink()
+        if not isinstance(op.get("created"), bool) or (backup is None) != op["created"]:
+            raise RoleSyncError(f"Invalid transaction operation entry: {op!r}")
+        payload = _transaction_file(backup) if backup else None
+        restores.append((target, payload))
+    for target, payload in restores:
+        if payload is not None:
+            _atomic_transaction_write(root, target, *payload)
+        else:
+            with _target_parent(root, target) as parent_fd:
+                try:
+                    os.unlink(target if parent_fd is None else target.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
     shutil.rmtree(txn, ignore_errors=True)
 
 
@@ -588,7 +694,7 @@ def _recover_incomplete(root: Path) -> None:
 
 
 def _apply_transaction(root: Path, output: dict[str, bytes], executables: set[str], stale: list[str], manifest_bytes: bytes) -> None:
-    txn = root / ".agents" / f".rolesync-txn-{uuid.uuid4().hex}"
+    txn = Path(tempfile.mkdtemp(prefix=".rolesync-txn-", dir=_transaction_home(root, create=True)))
     stage_dir = txn / "stage"
     backup_dir = txn / "backups"
     stage_dir.mkdir(parents=True)
@@ -631,9 +737,7 @@ def _apply_transaction(root: Path, output: dict[str, bytes], executables: set[st
             if op["stage"] is None:
                 target.unlink(missing_ok=True)
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _reject_symlink_chain(root, target.parent)
-            os.replace(stage_dir / op["stage"], target)
+            _atomic_transaction_write(root, target, *_transaction_file(stage_dir / op["stage"]))
         journal_path.write_text(json.dumps({"state": "complete", "operations": operations}, indent=2) + "\n", encoding="utf-8")
     except BaseException:
         _restore_transaction(root, txn)
@@ -696,5 +800,5 @@ def validate_project(root: Path) -> list[str]:
     except (OSError, UnicodeError, RoleSyncError, KeyError, TypeError) as exc:
         issues.append(str(exc))
     if _transaction_dirs(root):
-        issues.append("Incomplete rolesync transaction is present; run `rolesync sync` to recover it")
+        issues.append("Incomplete rolesync transaction is present; sync recovers private local state only. In-project transactions require manual review.")
     return issues
