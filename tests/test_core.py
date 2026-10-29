@@ -23,7 +23,7 @@ from rolesync.core import RoleSyncError, MANIFEST, render, sync
 class CoreSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name) / "project with ünicode"
+        self.root = (Path(self.temp.name) / "project with ünicode").resolve()
         home = Path(self.temp.name) / "home"
         home.mkdir()
         self.home_patch = mock.patch("rolesync.core.Path.home", return_value=home)
