@@ -97,7 +97,9 @@ Only paths recorded in the validated generated manifest are owned by RoleSync. U
 
 RoleSync treats repository paths and the generated manifest as untrusted input. Managed output paths must stay inside `.claude/agents/`, `.claude/skills/`, or `.codex/agents/`; traversal and escaping symlink paths are rejected. Stale entries receive the same containment validation before deletion.
 
-Synchronization is staged and guarded by a cross-process lock. Before applying a multi-file update, RoleSync stores recovery copies and a transaction journal. A later `sync` restores an interrupted transaction before generating new output.
+Synchronization is staged and guarded by a cross-process lock. Before applying a multi-file update, RoleSync stores recovery copies and a transaction journal in a private, per-project directory under `~/.rolesync-state/`, outside the checkout. A later `sync` restores an interrupted transaction before generating new output. Recovery rejects linked transaction components and uses exclusively created temporary files for atomic replacement.
+
+Legacy `.agents/.rolesync-txn-*` entries are reported by `check` and refused by `sync`: repository files cannot establish trusted recovery state. If one is present after upgrading, preserve it outside `.agents` for manual review before syncing. Do not copy it into `~/.rolesync-state/`. Review interrupted outputs against canonical sources and the ownership manifest before removing or restoring them.
 
 Canonical skill directories may contain binary resources; they are mirrored byte-for-byte for Claude, and a helper script's executable bit is mirrored too (mode handling is skipped on Windows). `check` reports a mode-only difference as `mode:<path>`, and `sync` repairs it. Common transient files are ignored, while likely secret files such as `.env`, private keys, and PKCS#12 bundles are rejected rather than copied. This is a guardrail, not a replacement for repository secret scanning.
 
